@@ -1,201 +1,222 @@
-/// Main entry for the PostgreSQL plugin
 use {
-    crate::{
-        accounts_selector::AccountsSelector,
-        postgres_client::{ParallelPostgresClient, PostgresClientBuilder},
-        transaction_selector::TransactionSelector,
-    },
+    crate::accounts_selector::AccountsSelector,
     bs58,
+    geyser_proto::{
+        slot_update::Status as SlotUpdateStatus, update::UpdateOneof, AccountWrite, Ping,
+        SlotUpdate, StartupPing, SubscribeRequest, SubscribeResponse, Update,
+    },
     log::*,
-    serde_derive::{Deserialize, Serialize},
+    serde_derive::Deserialize,
     serde_json,
     solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-        ReplicaTransactionInfoVersions, Result, SlotStatus,
+        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, Result as PluginResult,
+        SlotStatus, ReplicaBlockInfoVersions,
     },
-    solana_measure::measure::Measure,
-    solana_metrics::*,
-    std::{fs::File, io::Read},
-    thiserror::Error,
+    std::collections::HashSet,
+    std::convert::TryInto,
+    std::sync::atomic::{AtomicU64, Ordering},
+    std::sync::RwLock,
+    std::{fs::File, io::Read, sync::Arc, time::SystemTime},
+    tokio::sync::{broadcast, mpsc},
+    tonic::transport::Server,
 };
 
-#[derive(Default)]
-pub struct GeyserPluginPostgres {
-    client: Option<ParallelPostgresClient>,
-    accounts_selector: Option<AccountsSelector>,
-    transaction_selector: Option<TransactionSelector>,
-    batch_starting_slot: Option<u64>,
+pub mod geyser_proto {
+    tonic::include_proto!("accountsdb");
 }
 
-impl std::fmt::Debug for GeyserPluginPostgres {
+pub mod geyser_service {
+    use super::*;
+    use {
+        geyser_proto::accounts_db_server::AccountsDb,
+        tokio_stream::wrappers::ReceiverStream,
+        tonic::{Code, Request, Response, Status},
+    };
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct ServiceConfig {
+        broadcast_buffer_size: usize,
+        subscriber_buffer_size: usize,
+    }
+
+    #[derive(Debug)]
+    pub struct Service {
+        pub sender: broadcast::Sender<Update>,
+        pub config: ServiceConfig,
+        pub highest_write_slot: Arc<AtomicU64>,
+    }
+
+    impl Service {
+        pub fn new(config: ServiceConfig, highest_write_slot: Arc<AtomicU64>) -> Self {
+            let (tx, _) = broadcast::channel(config.broadcast_buffer_size);
+            Self {
+                sender: tx,
+                config,
+                highest_write_slot,
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl AccountsDb for Service {
+        type SubscribeStream = ReceiverStream<Result<Update, Status>>;
+
+        async fn subscribe(
+            &self,
+            _request: Request<SubscribeRequest>,
+        ) -> Result<Response<Self::SubscribeStream>, Status> {
+            info!("new subscriber");
+            let (tx, rx) = mpsc::channel(self.config.subscriber_buffer_size);
+            let mut broadcast_rx = self.sender.subscribe();
+
+            tx.send(Ok(Update {
+                update_oneof: Some(UpdateOneof::SubscribeResponse(SubscribeResponse {
+                    highest_write_slot: self.highest_write_slot.load(Ordering::SeqCst),
+                })),
+            }))
+            .await
+            .unwrap();
+
+            tokio::spawn(async move {
+                let mut exit = false;
+                while !exit {
+                    let fwd = broadcast_rx.recv().await.map_err(|err| {
+                        // Note: If we can't keep up pulling from the broadcast
+                        // channel here, there'll be a Lagged error, and we'll
+                        // close the connection because data was lost.
+                        warn!("error while receiving message to be broadcast: {:?}", err);
+                        exit = true;
+                        Status::new(Code::Internal, err.to_string())
+                    });
+                    if let Err(_err) = tx.send(fwd).await {
+                        info!("subscriber stream closed");
+                        exit = true;
+                    }
+                }
+            });
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+    }
+}
+
+pub struct PluginData {
+    runtime: Option<tokio::runtime::Runtime>,
+    server_broadcast: broadcast::Sender<Update>,
+    server_exit_sender: Option<broadcast::Sender<()>>,
+    accounts_selector: AccountsSelector,
+
+    /// Largest slot that an account write was processed for
+    highest_write_slot: Arc<AtomicU64>,
+
+    /// Accounts that saw account writes
+    ///
+    /// Needed to catch writes that signal account closure, where
+    /// lamports=0 and owner=system-program.
+    active_accounts: RwLock<HashSet<[u8; 32]>>,
+}
+
+#[derive(Default)]
+pub struct Plugin {
+    // initialized by on_load()
+    data: Option<PluginData>,
+}
+
+impl std::fmt::Debug for Plugin {
     fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
     }
 }
 
-/// The Configuration for the PostgreSQL plugin
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GeyserPluginPostgresConfig {
-    /// The host name or IP of the PostgreSQL server
-    pub host: Option<String>,
-
-    /// The user name of the PostgreSQL server.
-    pub user: Option<String>,
-
-    /// The port number of the PostgreSQL database, the default is 5432
-    pub port: Option<u16>,
-
-    /// The connection string of PostgreSQL database, if this is set
-    /// `host`, `user` and `port` will be ignored.
-    pub connection_str: Option<String>,
-
-    /// Controls the number of threads establishing connections to
-    /// the PostgreSQL server. The default is 10.
-    pub threads: Option<usize>,
-
-    /// Controls the batch size when bulk loading accounts.
-    /// The default is 10.
-    pub batch_size: Option<usize>,
-
-    /// Controls whether to panic the validator in case of errors
-    /// writing to PostgreSQL server. The default is false
-    pub panic_on_db_errors: Option<bool>,
-
-    /// Indicates whether to store historical data for accounts
-    pub store_account_historical_data: Option<bool>,
-
-    /// Controls whether to use SSL based connection to the database server.
-    /// The default is false
-    pub use_ssl: Option<bool>,
-
-    /// Specify the path to PostgreSQL server's certificate file
-    pub server_ca: Option<String>,
-
-    /// Specify the path to the local client's certificate file
-    pub client_cert: Option<String>,
-
-    /// Specify the path to the local client's private PEM key file.
-    pub client_key: Option<String>,
-
-    /// Controls whether to index the token owners. The default is false
-    pub index_token_owner: Option<bool>,
-
-    /// Controls whetherf to index the token mints. The default is false
-    pub index_token_mint: Option<bool>,
-
-    /// Controls if this plugin can read the database on_load() and find slot below that one everything should be in database
-    #[serde(default)]
-    pub batch_optimize_by_skiping_old_slots: bool,
+#[derive(Clone, Debug, Deserialize)]
+pub struct PluginConfig {
+    pub bind_address: String,
+    pub service_config: geyser_service::ServiceConfig,
 }
 
-#[derive(Error, Debug)]
-pub enum GeyserPluginPostgresError {
-    #[error("Error connecting to the backend data store. Error message: ({msg})")]
-    DataStoreConnectionError { msg: String },
-
-    #[error("Error preparing data store schema. Error message: ({msg})")]
-    DataSchemaError { msg: String },
-
-    #[error("Error preparing data store schema. Error message: ({msg})")]
-    ConfigurationError { msg: String },
-
-    #[error("Replica account V0.0.1 not supported anymore")]
-    ReplicaAccountV001NotSupported,
+impl PluginData {
+    fn broadcast(&self, update: UpdateOneof) {
+        // Don't care about the error that happens when there are no receivers.
+        let _ = self.server_broadcast.send(Update {
+            update_oneof: Some(update),
+        });
+    }
 }
 
-impl GeyserPlugin for GeyserPluginPostgres {
+impl GeyserPlugin for Plugin {
     fn name(&self) -> &'static str {
-        "GeyserPluginPostgres"
+        "GeyserPluginGrpc"
     }
 
-    /// Do initialization for the PostgreSQL plugin.
-    ///
-    /// # Format of the config file:
-    /// * The `accounts_selector` section allows the user to controls accounts selections.
-    /// "accounts_selector" : {
-    ///     "accounts" : \["pubkey-1", "pubkey-2", ..., "pubkey-n"\],
-    /// }
-    /// or:
-    /// "accounts_selector" = {
-    ///     "owners" : \["pubkey-1", "pubkey-2", ..., "pubkey-m"\]
-    /// }
-    /// Accounts either satisyfing the accounts condition or owners condition will be selected.
-    /// When only owners is specified,
-    /// all accounts belonging to the owners will be streamed.
-    /// The accounts field supports wildcard to select all accounts:
-    /// "accounts_selector" : {
-    ///     "accounts" : \["*"\],
-    /// }
-    /// * "host", optional, specifies the PostgreSQL server.
-    /// * "user", optional, specifies the PostgreSQL user.
-    /// * "port", optional, specifies the PostgreSQL server's port.
-    /// * "connection_str", optional, the custom PostgreSQL connection string.
-    /// Please refer to https://docs.rs/postgres/0.19.2/postgres/config/struct.Config.html for the connection configuration.
-    /// When `connection_str` is set, the values in "host", "user" and "port" are ignored. If `connection_str` is not given,
-    /// `host` and `user` must be given.
-    /// "store_account_historical_data", optional, set it to 'true', to store historical account data to account_audit
-    /// table.
-    /// * "threads" optional, specifies the number of worker threads for the plugin. A thread
-    /// maintains a PostgreSQL connection to the server. The default is '10'.
-    /// * "batch_size" optional, specifies the batch size of bulk insert when the AccountsDb is created
-    /// from restoring a snapshot. The default is '10'.
-    /// * "panic_on_db_errors", optional, contols if to panic when there are errors replicating data to the
-    /// PostgreSQL database. The default is 'false'.
-    /// * "transaction_selector", optional, controls if and what transaction to store. If this field is missing
-    /// None of the transction is stored.
-    /// "transaction_selector" : {
-    ///     "mentions" : \["pubkey-1", "pubkey-2", ..., "pubkey-n"\],
-    /// }
-    /// The `mentions` field support wildcard to select all transaction or all 'vote' transactions:
-    /// For example, to select all transactions:
-    /// "transaction_selector" : {
-    ///     "mentions" : \["*"\],
-    /// }
-    /// To select all vote transactions:
-    /// "transaction_selector" : {
-    ///     "mentions" : \["all_votes"\],
-    /// }
-    /// # Examples
-    ///
-    /// {
-    ///    "libpath": "/home/solana/target/release/libsolana_geyser_plugin_postgres.so",
-    ///    "host": "host_foo",
-    ///    "user": "solana",
-    ///    "threads": 10,
-    ///    "accounts_selector" : {
-    ///       "owners" : ["9oT9R5ZyRovSVnt37QvVoBttGpNqR3J7unkb567NP8k3"]
-    ///    }
-    /// }
-
-    fn on_load(&mut self, config_file: &str) -> Result<()> {
+    fn on_load(&mut self, config_file: &str) -> PluginResult<()> {
         solana_logger::setup_with_default("info");
         info!(
             "Loading plugin {:?} from config_file {:?}",
             self.name(),
             config_file
         );
+
         let mut file = File::open(config_file)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
 
         let result: serde_json::Value = serde_json::from_str(&contents).unwrap();
-        self.accounts_selector = Some(Self::create_accounts_selector_from_config(&result));
-        self.transaction_selector = Some(Self::create_transaction_selector_from_config(&result));
+        let accounts_selector = Self::create_accounts_selector_from_config(&result);
 
-        let config: GeyserPluginPostgresConfig =
-            serde_json::from_str(&contents).map_err(|err| {
-                GeyserPluginError::ConfigFileReadError {
-                    msg: format!(
-                        "The config file is not in the JSON format expected: {:?}",
-                        err
-                    ),
+        let config: PluginConfig = serde_json::from_str(&contents).map_err(|err| {
+            GeyserPluginError::ConfigFileReadError {
+                msg: format!(
+                    "The config file is not in the JSON format expected: {:?}",
+                    err
+                ),
+            }
+        })?;
+
+        let addr =
+            config
+                .bind_address
+                .parse()
+                .map_err(|err| GeyserPluginError::ConfigFileReadError {
+                    msg: format!("Error parsing the bind_address {:?}", err),
+                })?;
+
+        let highest_write_slot = Arc::new(AtomicU64::new(0));
+        let service =
+            geyser_service::Service::new(config.service_config, highest_write_slot.clone());
+        let (server_exit_sender, mut server_exit_receiver) = broadcast::channel::<()>(1);
+        let server_broadcast = service.sender.clone();
+
+        let server = geyser_proto::accounts_db_server::AccountsDbServer::new(service);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn(Server::builder().add_service(server).serve_with_shutdown(
+            addr,
+            async move {
+                let _ = server_exit_receiver.recv().await;
+            },
+        ));
+        let server_broadcast_c = server_broadcast.clone();
+        let mut server_exit_receiver = server_exit_sender.subscribe();
+        runtime.spawn(async move {
+            loop {
+                // Don't care about the error if there are no receivers.
+                let _ = server_broadcast_c.send(Update {
+                    update_oneof: Some(UpdateOneof::Ping(Ping {})),
+                });
+
+                tokio::select! {
+                    _ = server_exit_receiver.recv() => { break; },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
                 }
-            })?;
+            }
+        });
 
-        let (client, batch_optimize_by_skiping_older_slots) =
-            PostgresClientBuilder::build_pararallel_postgres_client(&config)?;
-        self.client = Some(client);
-        self.batch_starting_slot = batch_optimize_by_skiping_older_slots;
+        self.data = Some(PluginData {
+            runtime: Some(runtime),
+            server_broadcast,
+            server_exit_sender: Some(server_exit_sender),
+            accounts_selector,
+            highest_write_slot,
+            active_accounts: RwLock::new(HashSet::new()),
+        });
 
         Ok(())
     }
@@ -203,12 +224,17 @@ impl GeyserPlugin for GeyserPluginPostgres {
     fn on_unload(&mut self) {
         info!("Unloading plugin: {:?}", self.name());
 
-        match &mut self.client {
-            None => {}
-            Some(client) => {
-                client.join().unwrap();
-            }
-        }
+        let mut data = self.data.take().expect("plugin must be initialized");
+        data.server_exit_sender
+            .take()
+            .expect("on_unload can only be called once")
+            .send(())
+            .expect("sending grpc server termination should succeed");
+
+        data.runtime
+            .take()
+            .expect("must exist")
+            .shutdown_background();
     }
 
     fn update_account(
@@ -216,92 +242,64 @@ impl GeyserPlugin for GeyserPluginPostgres {
         account: ReplicaAccountInfoVersions,
         slot: u64,
         is_startup: bool,
-    ) -> Result<()> {
-        // skip updating account on startup of batch_optimize_by_skiping_older_slots
-        // is configured
-        if is_startup
-            && self
-                .batch_starting_slot
-                .map(|slot_limit| slot < slot_limit)
-                .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        let mut measure_all = Measure::start("geyser-plugin-postgres-update-account-main");
+    ) -> PluginResult<()> {
+        let data = self.data.as_ref().expect("plugin must be initialized");
         match account {
-            ReplicaAccountInfoVersions::V0_0_1(_) => {
-                return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::ReplicaAccountV001NotSupported,
-                )));
-            }
-            ReplicaAccountInfoVersions::V0_0_2(account) => {
-                let mut measure_select =
-                    Measure::start("geyser-plugin-postgres-update-account-select");
-                if let Some(accounts_selector) = &self.accounts_selector {
-                    if !accounts_selector.is_account_selected(account.pubkey, account.owner) {
-                        return Ok(());
-                    }
-                } else {
+            ReplicaAccountInfoVersions::V0_0_1(account) => {
+                if account.pubkey.len() != 32 {
+                    error!(
+                        "bad account pubkey length: {}",
+                        bs58::encode(account.pubkey).into_string()
+                    );
                     return Ok(());
                 }
-                measure_select.stop();
-                inc_new_counter_debug!(
-                    "geyser-plugin-postgres-update-account-select-us",
-                    measure_select.as_us() as usize,
-                    100000,
-                    100000
-                );
 
-                debug!(
-                    "Updating account {:?} with owner {:?} at slot {:?} using account selector {:?}",
+                // Select only accounts configured to look at, plus writes to accounts
+                // that were previously selected (to catch closures and account reuse)
+                let is_selected = data
+                    .accounts_selector
+                    .is_account_selected(account.pubkey, account.owner);
+                let previously_selected = {
+                    let read = data.active_accounts.read().unwrap();
+                    read.contains(&account.pubkey[0..32])
+                };
+                if !is_selected && !previously_selected {
+                    return Ok(());
+                }
+
+                // If the account is newly selected, add it
+                if !previously_selected {
+                    let mut write = data.active_accounts.write().unwrap();
+                    write.insert(account.pubkey.try_into().unwrap());
+                }
+
+                data.highest_write_slot.fetch_max(slot, Ordering::SeqCst);
+
+                /*println!(
+                    "Updating account {:?} with owner {:?} at slot {:?}",
                     bs58::encode(account.pubkey).into_string(),
                     bs58::encode(account.owner).into_string(),
                     slot,
-                    self.accounts_selector.as_ref().unwrap()
                 );
 
-                match &mut self.client {
-                    None => {
-                        return Err(GeyserPluginError::Custom(Box::new(
-                            GeyserPluginPostgresError::DataStoreConnectionError {
-                                msg: "There is no connection to the PostgreSQL database."
-                                    .to_string(),
-                            },
-                        )));
-                    }
-                    Some(client) => {
-                        let mut measure_update =
-                            Measure::start("geyser-plugin-postgres-update-account-client");
-                        let result = { client.update_account(account, slot, is_startup) };
-                        measure_update.stop();
+                println!("is_startup: {}", is_startup);
 
-                        inc_new_counter_debug!(
-                            "geyser-plugin-postgres-update-account-client-us",
-                            measure_update.as_us() as usize,
-                            100000,
-                            100000
-                        );
+                println!("before broadcast: {:#?}", SystemTime::now());*/
 
-                        if let Err(err) = result {
-                            return Err(GeyserPluginError::AccountsUpdateError {
-                                msg: format!("Failed to persist the update of account to the PostgreSQL database. Error: {:?}", err)
-                            });
-                        }
-                    }
-                }
+                data.broadcast(UpdateOneof::AccountWrite(AccountWrite {
+                    slot,
+                    pubkey: account.pubkey.to_vec(),
+                    lamports: account.lamports,
+                    owner: account.owner.to_vec(),
+                    executable: account.executable,
+                    rent_epoch: account.rent_epoch,
+                    data: account.data.to_vec(),
+                    write_version: account.write_version,
+                    is_startup,
+                    is_selected,
+                }));
             }
         }
-
-        measure_all.stop();
-
-        inc_new_counter_debug!(
-            "geyser-plugin-postgres-update-account-main-us",
-            measure_all.as_us() as usize,
-            100000,
-            100000
-        );
-
         Ok(())
     }
 
@@ -310,137 +308,45 @@ impl GeyserPlugin for GeyserPluginPostgres {
         slot: u64,
         parent: Option<u64>,
         status: SlotStatus,
-    ) -> Result<()> {
-        info!("Updating slot {:?} at with status {:?}", slot, status);
+    ) -> PluginResult<()> {
+        let data = self.data.as_ref().expect("plugin must be initialized");
+        //println!("Updating slot {:?} at with status {:?}", slot, status);
 
-        match &mut self.client {
-            None => {
-                return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::DataStoreConnectionError {
-                        msg: "There is no connection to the PostgreSQL database.".to_string(),
-                    },
-                )));
-            }
-            Some(client) => {
-                let result = client.update_slot_status(slot, parent, status);
-
-                if let Err(err) = result {
-                    return Err(GeyserPluginError::SlotStatusUpdateError{
-                        msg: format!("Failed to persist the update of slot to the PostgreSQL database. Error: {:?}", err)
-                    });
-                }
-            }
-        }
+        let status = match status {
+            SlotStatus::Processed => SlotUpdateStatus::Processed,
+            SlotStatus::Confirmed => SlotUpdateStatus::Confirmed,
+            SlotStatus::Rooted => SlotUpdateStatus::Rooted,
+        };
+        data.broadcast(UpdateOneof::SlotUpdate(SlotUpdate {
+            slot,
+            parent: parent.unwrap(),
+            status: status as i32,
+        }));
 
         Ok(())
     }
 
-    fn notify_end_of_startup(&mut self) -> Result<()> {
-        info!("Notifying the end of startup for accounts notifications");
-        match &mut self.client {
-            None => {
-                return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::DataStoreConnectionError {
-                        msg: "There is no connection to the PostgreSQL database.".to_string(),
-                    },
-                )));
+    #[allow(unused_variables)]
+    fn notify_block_metadata(&mut self, blockinfo: ReplicaBlockInfoVersions) -> PluginResult<()> {
+
+        let data = self.data.as_ref().expect("plugin must be initialized");
+        match blockinfo {
+            ReplicaBlockInfoVersions::V0_0_1(info) => {
+                println!("broadcasting slot: {:?}", info.slot);
+                data.broadcast(UpdateOneof::StartupPing(StartupPing{}));
             }
-            Some(client) => {
-                let result = client.notify_end_of_startup();
-
-                if let Err(err) = result {
-                    return Err(GeyserPluginError::SlotStatusUpdateError{
-                        msg: format!("Failed to notify the end of startup for accounts notifications. Error: {:?}", err)
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn notify_transaction(
-        &mut self,
-        transaction_info: ReplicaTransactionInfoVersions,
-        slot: u64,
-    ) -> Result<()> {
-        match &mut self.client {
-            None => {
-                return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::DataStoreConnectionError {
-                        msg: "There is no connection to the PostgreSQL database.".to_string(),
-                    },
-                )));
-            }
-            Some(client) => match transaction_info {
-                ReplicaTransactionInfoVersions::V0_0_1(transaction_info) => {
-                    if let Some(transaction_selector) = &self.transaction_selector {
-                        if !transaction_selector.is_transaction_selected(
-                            transaction_info.is_vote,
-                            Box::new(transaction_info.transaction.message().account_keys().iter()),
-                        ) {
-                            return Ok(());
-                        }
-                    } else {
-                        return Ok(());
-                    }
-
-                    let result = client.log_transaction_info(transaction_info, slot);
-
-                    if let Err(err) = result {
-                        return Err(GeyserPluginError::SlotStatusUpdateError{
-                                msg: format!("Failed to persist the transaction info to the PostgreSQL database. Error: {:?}", err)
-                            });
-                    }
-                }
-            },
         }
 
         Ok(())
+
     }
 
-    fn notify_block_metadata(&mut self, block_info: ReplicaBlockInfoVersions) -> Result<()> {
-        match &mut self.client {
-            None => {
-                return Err(GeyserPluginError::Custom(Box::new(
-                    GeyserPluginPostgresError::DataStoreConnectionError {
-                        msg: "There is no connection to the PostgreSQL database.".to_string(),
-                    },
-                )));
-            }
-            Some(client) => match block_info {
-                ReplicaBlockInfoVersions::V0_0_1(block_info) => {
-                    let result = client.update_block_metadata(block_info);
-
-                    if let Err(err) = result {
-                        return Err(GeyserPluginError::SlotStatusUpdateError{
-                                msg: format!("Failed to persist the update of block metadata to the PostgreSQL database. Error: {:?}", err)
-                            });
-                    }
-                }
-            },
-        }
-
+    fn notify_end_of_startup(&mut self) -> PluginResult<()> {
         Ok(())
-    }
-
-    /// Check if the plugin is interested in account data
-    /// Default is true -- if the plugin is not interested in
-    /// account data, please return false.
-    fn account_data_notifications_enabled(&self) -> bool {
-        self.accounts_selector
-            .as_ref()
-            .map_or_else(|| false, |selector| selector.is_enabled())
-    }
-
-    /// Check if the plugin is interested in transaction data
-    fn transaction_notifications_enabled(&self) -> bool {
-        self.transaction_selector
-            .as_ref()
-            .map_or_else(|| false, |selector| selector.is_enabled())
     }
 }
 
-impl GeyserPluginPostgres {
+impl Plugin {
     fn create_accounts_selector_from_config(config: &serde_json::Value) -> AccountsSelector {
         let accounts_selector = &config["accounts_selector"];
 
@@ -472,55 +378,15 @@ impl GeyserPluginPostgres {
             AccountsSelector::new(&accounts, &owners)
         }
     }
-
-    fn create_transaction_selector_from_config(config: &serde_json::Value) -> TransactionSelector {
-        let transaction_selector = &config["transaction_selector"];
-
-        if transaction_selector.is_null() {
-            TransactionSelector::default()
-        } else {
-            let accounts = &transaction_selector["mentions"];
-            let accounts: Vec<String> = if accounts.is_array() {
-                accounts
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|val| val.as_str().unwrap().to_string())
-                    .collect()
-            } else {
-                Vec::default()
-            };
-            TransactionSelector::new(&accounts)
-        }
-    }
-
-    pub fn new() -> Self {
-        Self::default()
-    }
 }
 
 #[no_mangle]
 #[allow(improper_ctypes_definitions)]
 /// # Safety
 ///
-/// This function returns the GeyserPluginPostgres pointer as trait GeyserPlugin.
+/// This function returns the Plugin pointer as trait GeyserPlugin.
 pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
-    let plugin = GeyserPluginPostgres::new();
+    let plugin = Plugin::default();
     let plugin: Box<dyn GeyserPlugin> = Box::new(plugin);
     Box::into_raw(plugin)
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use {super::*, serde_json};
-
-    #[test]
-    fn test_accounts_selector_from_config() {
-        let config = "{\"accounts_selector\" : { \
-           \"owners\" : [\"9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin\"] \
-        }}";
-
-        let config: serde_json::Value = serde_json::from_str(config).unwrap();
-        GeyserPluginPostgres::create_accounts_selector_from_config(&config);
-    }
 }

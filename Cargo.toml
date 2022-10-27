@@ -1,50 +1,43 @@
 [package]
-authors = ["Solana Maintainers <maintainers@solana.foundation>"]
+name = "geyser"
+version = "0.2.0"
 edition = "2021"
-name = "solana-geyser-plugin-postgres"
-description = "The Solana AccountsDb plugin for PostgreSQL database."
-version = "1.11.1"
-repository = "https://github.com/solana-labs/solana"
-license = "Apache-2.0"
-homepage = "https://solana.com/"
-documentation = "https://docs.rs/solana-validator"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bs58 = "0.4.0"
-bytemuck = "1.7.2"
+rand = "0.8.4"
+solana-geyser-plugin-interface = "1.13.3"
+solana-program = "=1.13.3"
+solana-logger= "1.13.3"
+solana-metrics= "1.13.3"
+solana-measure= "1.13.3"
+solana-account-decoder = "=1.13.3"
+solana-sdk = "1.13.3"
+solana-client = "1.13.3"
+log = "0.4.14"
 chrono = { version = "0.4.11", features = ["serde"] }
 crossbeam-channel = "0.5"
-log = "0.4.14"
-openssl = { version = "0.10" }
-postgres = { version = "0.19.2", features = ["with-chrono-0_4"] }
-postgres-types = { version = "0.2.2", features = ["derive"] }
-postgres-openssl = { version = "0.5.0"}
 serde = "1.0.133"
 serde_derive = "1.0.103"
 serde_json = "1.0.74"
-solana-geyser-plugin-interface = { version = "=1.11.1" }
-solana-logger = { version = "=1.11.1" }
-solana-measure = { version = "=1.11.1" }
-solana-metrics = { version = "=1.11.1" }
-solana-runtime = { version = "=1.11.1" }
-solana-sdk = { version = "=1.11.1" }
-solana-transaction-status = { version = "=1.11.1" }
 thiserror = "1.0.30"
-tokio-postgres = "0.7.4"
+borsh = "0.9.0"
+libmath = "0.2.1"
+num-derive = "0.3"
+num-traits = "0.2"
+num = "0.4"
+tokio = "1.21.2"
+void = "1.0.2"
+tonic = "0.8.2"
+prost = "0.11.0"
+protoc = "2.28.0"
+tokio-stream = "0.1.11"
 
-[dev-dependencies]
-libc = "0.2.112"
-libloading = "0.7.2"
-serial_test = "0.5.1"
-solana-account-decoder = { version = "=1.11.1" }
-solana-core = { version = "=1.11.1" }
-solana-local-cluster = { version = "=1.11.1" }
-solana-net-utils = { version = "=1.11.1" }
-solana-streamer = { version = "=1.11.1" }
-tempfile = "3.2.0"
+[build-dependencies]
+tonic-build = "0.8.2"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
